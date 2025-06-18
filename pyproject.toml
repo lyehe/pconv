@@ -1,0 +1,41 @@
+[project]
+name = "pconv"
+version = "0.1.0"
+description = "Optimized partial convolution."
+authors = [{ name = "Yehe Liu", email = "yehe@case.edu" }]
+license = { text = "MIT License" }
+readme = "README.md"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.7.0",
+    "torchvision>=0.22.0",
+    "numpy>=1.26.4",
+    "tqdm>=4.66.2",
+    "ipykernel>=6.29.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.3.0",
+    "jupyter>=1.0.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
