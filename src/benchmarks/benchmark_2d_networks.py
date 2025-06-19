@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.benchmark as tbenchmark
 
-EPSILON = 1e-8
+EPSILON = 1e-6
 
 
 ###############################################################################
@@ -92,9 +92,9 @@ class NvidiaPartialConv2d(nn.Conv2d):
                     groups=1,
                 )
 
-                # for mixed precision training, change 1e-8 to 1e-6
-                self.mask_ratio = self.slide_winsize / (self.update_mask + 1e-8)
-                # self.mask_ratio = torch.max(self.update_mask)/(self.update_mask + 1e-8)
+                # for mixed precision training, change 1e-6 to 1e-6
+                self.mask_ratio = self.slide_winsize / (self.update_mask + 1e-6)
+                # self.mask_ratio = torch.max(self.update_mask)/(self.update_mask + 1e-6)
                 self.update_mask = torch.clamp(self.update_mask, 0, 1)
                 self.mask_ratio = torch.mul(self.mask_ratio, self.update_mask)
 
@@ -146,8 +146,7 @@ class OptimizedPartialConv2d(nn.Conv2d):
             self._last_mask_ptr = None
             self._last_result = None
 
-        if self.bias is not None:
-            self.register_buffer("_bias_view", self.bias.view(1, -1, 1, 1))
+        # Don't register bias_view as a buffer - compute it dynamically!
 
     def _compute_mask_updates(
         self, mask: torch.Tensor
@@ -195,7 +194,8 @@ class OptimizedPartialConv2d(nn.Conv2d):
                 groups=groups_for_mask_conv,
             )
 
-            mask_ratio = self.slide_winsize / (update_mask + EPSILON)
+            # For mixed precision training, consider using 1e-6 instead of 1e-6
+            mask_ratio = self.slide_winsize / (update_mask + 1e-6)
             update_mask = torch.clamp(update_mask, 0, 1)
             mask_ratio = mask_ratio * update_mask
 
@@ -221,6 +221,7 @@ class OptimizedPartialConv2d(nn.Conv2d):
 
         update_mask, mask_ratio = self._compute_mask_updates(input_mask_for_calc)
 
+        # Determine mask for element-wise multiplication with input_tensor
         current_mask_for_input_mult = input_mask_for_calc
         if (
             self.multi_channel
@@ -248,7 +249,7 @@ class OptimizedPartialConv2d(nn.Conv2d):
         output = F.conv2d(
             masked_input,
             self.weight,
-            bias=None,
+            bias=None,  # Bias handled after scaling
             stride=self.stride,
             padding=self.padding,
             dilation=self.dilation,
@@ -256,11 +257,12 @@ class OptimizedPartialConv2d(nn.Conv2d):
         )
 
         if self.bias is not None:
-            output.mul_(mask_ratio)
-            output.add_(self._bias_view)
-            output.mul_(update_mask)
+            # CRITICAL FIX: Compute bias view dynamically for proper gradient flow
+            bias_view = self.bias.view(1, self.out_channels, 1, 1)
+            output = output * mask_ratio + bias_view
+            output = output * update_mask
         else:
-            output.mul_(mask_ratio)
+            output = output * mask_ratio
 
         if self.return_mask:
             return output, update_mask

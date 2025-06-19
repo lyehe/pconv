@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import torch.utils.benchmark as tbenchmark
 
 # A small constant to prevent division by zero
-EPSILON = 1e-8
+EPSILON = 1e-6
 
 
 ###############################################################################
@@ -98,8 +98,8 @@ class NvidiaPartialConv3d(nn.Conv3d):
                     groups=1,
                 )
 
-                self.mask_ratio = self.slide_winsize / (self.update_mask + 1e-8)
-                # self.mask_ratio = torch.max(self.update_mask)/(self.update_mask + 1e-8)
+                self.mask_ratio = self.slide_winsize / (self.update_mask + 1e-6)
+                # self.mask_ratio = torch.max(self.update_mask)/(self.update_mask + 1e-6)
                 self.update_mask = torch.clamp(self.update_mask, 0, 1)
                 self.mask_ratio = torch.mul(self.mask_ratio, self.update_mask)
 
@@ -146,13 +146,11 @@ class OptimizedPartialConv3d(nn.Conv3d):
         kernel_elements = (
             self.kernel_size[0] * self.kernel_size[1] * self.kernel_size[2]
         )
-        if (
-            self.multi_channel
-        ):  # This should be based on the effective input channels for the mask conv
+        if self.multi_channel:
             self.slide_winsize = float(
                 kernel_elements * (self.in_channels // self.groups)
             )
-        else:  # If not multi_channel, mask is treated as single channel for sum pooling
+        else:
             self.slide_winsize = float(kernel_elements)
 
         # Initialize cache
@@ -161,9 +159,7 @@ class OptimizedPartialConv3d(nn.Conv3d):
             self._last_mask_ptr = None
             self._last_result = None
 
-        # Register persistent buffer for bias view
-        if self.bias is not None:
-            self.register_buffer("_bias_view", self.bias.view(1, -1, 1, 1, 1))
+        # DON'T register bias_view as a buffer - compute it dynamically!
 
     def _compute_mask_updates(
         self, mask: torch.Tensor
@@ -172,27 +168,21 @@ class OptimizedPartialConv3d(nn.Conv3d):
         if (
             self.cache_masks
             and self._last_mask_shape == mask.shape
-            and self._last_mask_ptr
-            == mask.data_ptr()  # Check if it's the same tensor object
+            and self._last_mask_ptr == mask.data_ptr()
         ):
             return self._last_result
 
         with torch.no_grad():
             # Create weight for sum pooling on-the-fly
             if not self.multi_channel or mask.shape[1] == 1:
-                # If not multi_channel OR if the input mask is already single-channel,
-                # treat the mask as single-channel for sum pooling.
                 mask_for_sum = mask if mask.shape[1] == 1 else mask[:, 0:1, ...]
                 conv_weight = torch.ones(
                     1, 1, *self.kernel_size, device=mask.device, dtype=mask.dtype
                 )
-                # For sum pooling a single channel (or effectively single channel) mask, groups is 1
                 groups_for_mask_conv = 1
-            else:  # multi_channel is True and mask.shape[1] > 1 (presumably == self.in_channels)
+            else:
                 mask_for_sum = mask
-                if (
-                    self.groups == 1
-                ):  # Standard convolution, sum over all in_channels of the mask
+                if self.groups == 1:
                     conv_weight = torch.ones(
                         1,
                         self.in_channels,
@@ -201,23 +191,16 @@ class OptimizedPartialConv3d(nn.Conv3d):
                         dtype=mask.dtype,
                     )
                     groups_for_mask_conv = 1
-                else:  # Grouped convolution, sum mask channels within each group
+                else:
                     channels_per_group = self.in_channels // self.groups
-                    # The conv_weight for mask sum pooling should reflect the grouping structure
-                    # It should be (self.groups, channels_per_group_mask, k, k, k)
-                    # where channels_per_group_mask is channels_per_group if mask is grouped like input,
-                    # or 1 if we sum all channels within a group of the mask to a single channel.
-                    # Given the slide_winsize calculation, it implies summing all relevant input channels.
                     conv_weight = torch.ones(
-                        self.groups,  # Number of output groups for the mask conv
-                        channels_per_group,  # Number of input channels per group for the mask
+                        self.groups,
+                        channels_per_group,
                         *self.kernel_size,
                         device=mask.device,
                         dtype=mask.dtype,
                     )
-                    groups_for_mask_conv = (
-                        self.groups
-                    )  # Mask conv is grouped like main conv
+                    groups_for_mask_conv = self.groups
 
             # Perform sum pooling
             update_mask = F.conv3d(
@@ -227,15 +210,14 @@ class OptimizedPartialConv3d(nn.Conv3d):
                 stride=self.stride,
                 padding=self.padding,
                 dilation=self.dilation,
-                groups=groups_for_mask_conv,  # Use the determined groups for mask conv
+                groups=groups_for_mask_conv,
             )
 
             # Calculate ratio and clamp mask
-            mask_ratio = self.slide_winsize / (update_mask + EPSILON)
-            update_mask = torch.clamp(update_mask, 0, 1)  # Clamp sum to 0-1 range
-            mask_ratio = (
-                mask_ratio * update_mask
-            )  # Apply correction factor only to valid areas
+            # For mixed precision training, consider using 1e-6 instead of 1e-6
+            mask_ratio = self.slide_winsize / (update_mask + 1e-6)
+            update_mask = torch.clamp(update_mask, 0, 1)
+            mask_ratio = mask_ratio * update_mask
 
         # Update cache
         if self.cache_masks:
@@ -249,39 +231,30 @@ class OptimizedPartialConv3d(nn.Conv3d):
         self, input_tensor: torch.Tensor, mask: torch.Tensor | None = None
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if mask is None:
-            # If no mask is provided, create a single-channel mask of ones.
-            # This will be handled correctly by _compute_mask_updates.
             mask = torch.ones(
                 input_tensor.shape[0],
-                1,  # Always create a single channel mask here if None
+                1,
                 *input_tensor.shape[2:],
                 device=input_tensor.device,
                 dtype=input_tensor.dtype,
             )
 
-        # If multi_channel is True and the input mask is single channel but the input tensor is multi-channel,
-        # the mask should be expanded to match the input tensor's channels for element-wise multiplication.
-        # This is for `input_tensor * mask`. The `_compute_mask_updates` handles its own logic.
+        # Handle mask expansion for input multiplication
         current_mask_for_input_mult = mask
         if self.multi_channel and mask.shape[1] == 1 and input_tensor.shape[1] != 1:
             current_mask_for_input_mult = mask.expand(
                 -1, input_tensor.shape[1], -1, -1, -1
             )
-        elif (
-            not self.multi_channel and mask.shape[1] != 1
-        ):  # Using first channel of mask if not multi_channel
+        elif not self.multi_channel and mask.shape[1] != 1:
             current_mask_for_input_mult = mask[:, 0:1, ...].expand(
                 -1, input_tensor.shape[1], -1, -1, -1
             )
 
-        update_mask, mask_ratio = self._compute_mask_updates(
-            mask
-        )  # Pass original mask to compute updates
+        update_mask, mask_ratio = self._compute_mask_updates(mask)
 
-        # Main convolution is performed *without* bias, as it's handled manually
+        # Main convolution without bias
         output = F.conv3d(
-            input_tensor
-            * current_mask_for_input_mult,  # Use potentially expanded/selected mask
+            input_tensor * current_mask_for_input_mult,
             self.weight,
             None,  # Bias is None
             self.stride,
@@ -290,18 +263,26 @@ class OptimizedPartialConv3d(nn.Conv3d):
             self.groups,
         )
 
-        # Apply partial conv formula with in-place operations
+        # Apply partial conv formula with proper gradient flow
         if self.bias is not None:
-            output.mul_(mask_ratio)  # In-place multiplication by ratio
-            output.add_(self._bias_view)  # In-place addition of bias
-            output.mul_(update_mask)  # In-place application of final mask
+            # CRITICAL FIX: Compute bias view dynamically for proper gradient flow
+            bias_view = self.bias.view(1, self.out_channels, 1, 1, 1)
+            output = output * mask_ratio + bias_view
+            output = output * update_mask
         else:
-            output.mul_(mask_ratio)
+            output = output * mask_ratio
 
         if self.return_mask:
             return output, update_mask
 
         return output
+
+    def clear_cache(self):
+        """Clear the mask cache. Useful when switching between different mask patterns."""
+        if self.cache_masks:
+            self._last_mask_shape = None
+            self._last_mask_ptr = None
+            self._last_result = None
 
 
 ###############################################################################
