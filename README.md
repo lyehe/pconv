@@ -4,7 +4,7 @@ Optimized implementation of Partial Convolution from Nvidia's [nvidia/partialcon
 The original implementation is slow especially for 3D convolutions, and has high memory overhead due to persistent tensors.
 This optimized version addresses these issues by dynamically creating necessary tensors, improving caching mechanisms, and refining the handling of mask operations.
 Benchmark cases generated with Claude.
-The performance improvements are particularly significant for larger models and 3D convolutions.
+The performance improvements are particularly significant for larger models and 3D convolutions in older GPUs.
 
 ### Specific Optimizations
 
